@@ -1,5 +1,3 @@
-Markdown
-
 # Luck Dice - Hệ thống game cá cược trực tuyến 
 
 ![Python](https://img.shields.io/badge/Python-3.10+-blue.svg) 
