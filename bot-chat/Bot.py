@@ -4,6 +4,7 @@ import random
 import os
 import threading
 import string
+from queue import Queue
 
 class AutoRegisterAndSpam:
     def __init__(self):
@@ -12,6 +13,9 @@ class AutoRegisterAndSpam:
         self.accounts_file = "data/account/accounts.txt"
         self.accounts = self.load_accounts()
         self.is_spamming = True
+        self.token_lock = threading.Lock()  # Khóa để đồng bộ truy cập token
+        self.account_tokens = {}  # Lưu trữ token theo username
+        self.token_queue = Queue()  # Hàng đợi để yêu cầu làm mới token (dự phòng)
 
         # Danh sách prefixes và suffixes để tạo username
         self.prefixes = [
@@ -33,7 +37,7 @@ class AutoRegisterAndSpam:
         self.chanle_choices = ["Chẵn", "Lẻ"]
         self.baucua_choices = ["Bầu", "Cua", "Tôm", "Cá", "Gà", "Nai"]
 
-        # Danh sách actions mở rộng
+        # Danh sách actions, emotions, money_units, streaks, feelings giữ nguyên như cũ
         self.actions = [
             "cược", "húp", "all-in", "thử", "đi", "chơi", "đặt", "vào", "đánh", "bỏ", "tăng", "giảm",
             "chốt", "xem", "theo", "bám", "đu", "call", "vô", "chơi lớn", "đặt mạnh", "đi hết", "đặt nhẹ",
@@ -46,8 +50,6 @@ class AutoRegisterAndSpam:
             "đặt khủng", "vào khủng", "đánh khủng", "chơi max", "đặt hết luôn", "vào hết luôn", "đánh hết luôn",
             "thử lớn", "cược lớn", "húp lớn", "đi lớn", "chốt lớn", "đặt nhỏ nhẹ", "vào nhỏ nhẹ", "đánh nhỏ nhẹ"
         ]
-
-        # Danh sách emotions mở rộng
         self.emotions = [
             "húp nào!", "chắc chắn luôn!", "ai theo không?", "tiếc ghê!", "thắng lớn!", "thua rồi!",
             "hot lắm!", "cược nào!", "đỉnh quá!", "hên ghê!", "xui quá!", "vào đi!", "chốt đi!",
@@ -65,11 +67,7 @@ class AutoRegisterAndSpam:
             "căng hết mức!", "hồi hộp muốn xỉu!", "đã không tả nổi!", "tuyệt không tưởng!", "đi luôn nào!",
             "chơi hết mình đi!", "bình tĩnh chút nào!", "đỉnh nhất quả đất!", "hết sảy!", "quá chất luôn!"
         ]
-
-        # Danh sách money_units
         self.money_units = ["", "k", "củ", "triệu"]
-
-        # Danh sách streaks mở rộng
         self.streaks = [
             "", "2 ván rồi", "3 ván rồi", "4 ván rồi", "5 ván rồi", "liên tiếp", "mấy ván rồi",
             "2 lần rồi", "3 lần rồi", "4 lần rồi", "5 lần rồi", "liên tục", "mấy lần rồi",
@@ -85,8 +83,6 @@ class AutoRegisterAndSpam:
             "6 ván liền", "7 ván liền", "8 ván liền", "9 ván liền", "10 ván liền", "hơn chục ván liền",
             "6 lần liền", "7 lần liền", "8 lần liền", "9 lần liền", "10 lần liền", "hơn chục lần liền"
         ]
-
-        # Danh sách feelings mở rộng
         self.feelings = [
             "", "tui cảm giác", "tui thấy", "tui đoán", "tui nghĩ", "tui tin", "hình như", "chắc là",
             "có vẻ", "tui biết", "tui nghe", "tui bảo", "tui nói", "tui chắc", "tui khẳng định",
@@ -99,6 +95,9 @@ class AutoRegisterAndSpam:
             "tui linh cảm là", "tui chắc chắn là", "tui khẳng định là", "tui tiên đoán là", "tui phán là",
             "tui thấy rõ ràng", "tui đoán đúng", "tui tin đúng", "tui cảm giác đúng", "tui nghĩ đúng"
         ]
+
+        # Khởi động thread làm mới token (dự phòng)
+        threading.Thread(target=self.refresh_token_worker, daemon=True).start()
 
     def load_server_config(self):
         config = {"ip": "127.0.0.1", "port": 9999}
@@ -167,12 +166,15 @@ class AutoRegisterAndSpam:
         try:
             response = requests.post(f"{self.base_url}/login", json=data, timeout=5)
             response.raise_for_status()
-            if response.json().get("status") == "success":
-                token = response.json().get("access_token")
+            result = response.json()
+            if result.get("status") == "success":
+                token = result.get("access_token")
                 print(f"Đăng nhập thành công: {username}")
                 return token
             else:
-                print(f"Đăng nhập thất bại: {username} - {response.json().get('message')}")
+                print(f"Đăng nhập thất bại: {username} - {result.get('message')}")
+                if "Tài khoản bị cấm" in result.get("message", ""):
+                    print(f"Tài khoản {username} bị cấm, bỏ qua.")
                 return None
         except requests.exceptions.RequestException as e:
             print(f"Lỗi khi đăng nhập tài khoản {username}: {str(e)}")
@@ -181,15 +183,12 @@ class AutoRegisterAndSpam:
     def generate_random_money(self):
         unit = random.choice(self.money_units)
         if unit == "triệu" or unit == "củ":
-            # Đảm bảo số tiền tối thiểu là 1 triệu khi dùng đơn vị "triệu" hoặc "củ"
-            base_amount = random.randint(1, 1000) * 1000000  # Từ 1 triệu đến 1 tỷ
+            base_amount = random.randint(1, 1000) * 1000000
             return f"{base_amount // 1000000} {unit}"
         elif unit == "k":
-            # Số tiền tối thiểu là 1k khi dùng đơn vị "k"
-            base_amount = random.randint(1, 1000) * 1000  # Từ 1k đến 1 triệu
+            base_amount = random.randint(1, 1000) * 1000
             return f"{base_amount // 1000}k"
         else:
-            # Không đơn vị, số tiền từ 1,000 đến 1,000,000
             base_amount = random.randint(1, 1000) * 1000
             return f"{base_amount:,}"
 
@@ -209,6 +208,7 @@ class AutoRegisterAndSpam:
                 return f"{game} tui {action} {money} {choice}, {emotion}"
             elif message_type == 2:
                 outcome = "thắng lớn!" if (result > 10 and choice == "Tài") or (result <= 10 and choice == "Xỉu") else "thua rồi!"
+                returntalk = random.choice(self.taixiu_choices)
                 return f"{game} ra {result}, {choice} {outcome}"
             elif message_type == 3:
                 return f"{choice} đi anh em ơi, {feeling} {choice} {streak}, {emotion}"
@@ -249,38 +249,90 @@ class AutoRegisterAndSpam:
 
     def send_message(self, token, sender, message):
         headers = {"Authorization": f"Bearer {token}"}
-        data = {"message": message, "sender": sender}
+        data = {"message": message}
         try:
             response = requests.post(f"{self.base_url}/send_message", json=data, headers=headers, timeout=5)
             response.raise_for_status()
             print(f"Đã gửi tin nhắn: [{sender}] {message}")
+            return True
+        except requests.exceptions.HTTPError as e:
+            if e.response.status_code == 401:
+                print(f"Token hết hạn cho {sender}, sẽ làm mới token ngay lập tức...")
+                return False
+            else:
+                print(f"Lỗi khi gửi tin nhắn: {str(e)}")
+                return False
         except requests.exceptions.RequestException as e:
             print(f"Lỗi khi gửi tin nhắn: {str(e)}")
-            time.sleep(5)
+            return False
+
+    def refresh_token_worker(self):
+        # Giữ lại worker này như một cơ chế dự phòng, nhưng ít được sử dụng nhờ làm mới token ngay lập tức
+        while self.is_spamming:
+            try:
+                username, password = self.token_queue.get(timeout=1)
+                new_token = self.login_account(username, password)
+                with self.token_lock:
+                    if new_token:
+                        self.account_tokens[username] = new_token
+                        print(f"Đã làm mới token cho {username} từ queue")
+                    else:
+                        print(f"Không thể làm mới token cho {username}, xóa khỏi danh sách")
+                        if username in self.account_tokens:
+                            del self.account_tokens[username]
+                self.token_queue.task_done()
+            except Queue.Empty:
+                time.sleep(0.1)  # Tránh CPU usage cao khi queue rỗng
 
     def spam_messages(self):
-        # Đăng nhập tất cả tài khoản trước và lưu token
-        account_tokens = {}
-        for account in self.accounts:
+        # Đăng nhập ban đầu cho tất cả tài khoản
+        for account in self.accounts[:]:  # Sao chép danh sách để tránh lỗi khi xóa
             username = account["username"]
             password = account["password"]
             token = self.login_account(username, password)
             if token:
-                account_tokens[username] = token
+                with self.token_lock:
+                    self.account_tokens[username] = token
+            else:
+                self.accounts.remove(account)  # Xóa tài khoản không đăng nhập được
 
-        if not account_tokens:
+        if not self.account_tokens:
             print("Không có tài khoản nào đăng nhập thành công, dừng spam.")
             return
 
         print("Bắt đầu spam tin nhắn với delay ngẫu nhiên 1-3 giây...")
         while self.is_spamming:
-            # Chọn ngẫu nhiên một tài khoản để gửi tin nhắn
-            username = random.choice(list(account_tokens.keys()))
-            token = account_tokens[username]
+            with self.token_lock:
+                if not self.account_tokens:
+                    print("Không còn tài khoản nào hoạt động, dừng spam.")
+                    break
+                username = random.choice(list(self.account_tokens.keys()))
+                token = self.account_tokens[username]
+            
             message = self.generate_random_message()
-            self.send_message(token, username, message)
-            # Delay ngẫu nhiên từ 3 đến 10 giây
-            delay = random.uniform(1, 3)
+            success = self.send_message(token, username, message)
+            
+            # Làm mới token ngay lập tức bất kể gửi thành công hay thất bại
+            password = self.accounts[[acc["username"] for acc in self.accounts].index(username)]["password"]
+            new_token = self.login_account(username, password)
+            with self.token_lock:
+                if new_token:
+                    self.account_tokens[username] = new_token
+                    print(f"Đã làm mới token cho {username} sau khi gửi tin nhắn")
+                else:
+                    print(f"Không thể làm mới token cho {username}, xóa khỏi danh sách")
+                    if username in self.account_tokens:
+                        del self.account_tokens[username]
+                    continue  # Bỏ qua nếu không làm mới được token
+
+            # Nếu gửi thất bại, thử lại với token mới
+            if not success:
+                with self.token_lock:
+                    if username in self.account_tokens:
+                        token = self.account_tokens[username]
+                        self.send_message(token, username, message)  # Thử lại với token mới
+            
+            delay = random.uniform(0.1, 1.5)
             time.sleep(delay)
 
     def register_accounts(self):
@@ -292,7 +344,6 @@ class AutoRegisterAndSpam:
                 time.sleep(5)
 
     def start_spamming(self):
-        # Chạy spam trong một thread riêng
         spam_thread = threading.Thread(target=self.spam_messages, daemon=True)
         spam_thread.start()
         return spam_thread
@@ -305,7 +356,6 @@ if __name__ == "__main__":
     else:
         print(f"Đã có đủ {spammer.target_accounts} tài khoản, chuyển sang spam...")
 
-    # Bắt đầu spam và giữ chương trình chạy
     spam_thread = spammer.start_spamming()
     try:
         while True:
